@@ -23,6 +23,7 @@ async function handle(
 ) {
   const apiPath = `/api/${params.provider}`;
   console.log(`[${params.provider} Route] params `, params);
+
   switch (apiPath) {
     case ApiPath.Azure:
       return azureHandler(req, { params });
@@ -36,7 +37,6 @@ async function handle(
       return bytedanceHandler(req, { params });
     case ApiPath.Alibaba:
       return alibabaHandler(req, { params });
-    // case ApiPath.Tencent: using "/api/tencent"
     case ApiPath.Moonshot:
       return moonshotHandler(req, { params });
     case ApiPath.Stability:
@@ -52,6 +52,7 @@ async function handle(
     case ApiPath.SiliconFlow:
       return siliconflowHandler(req, { params });
     case ApiPath.OpenAI:
+      // ✅ OpenAI 走专门 handler（下个文件）
       return openaiHandler(req, { params });
     case ApiPath["302.AI"]:
       return ai302Handler(req, { params });
@@ -63,23 +64,6 @@ async function handle(
 export const GET = handle;
 export const POST = handle;
 
-export const runtime = "edge";
-export const preferredRegion = [
-  "arn1",
-  "bom1",
-  "cdg1",
-  "cle1",
-  "cpt1",
-  "dub1",
-  "fra1",
-  "gru1",
-  "hnd1",
-  "iad1",
-  "icn1",
-  "kix1",
-  "lhr1",
-  "pdx1",
-  "sfo1",
-  "sin1",
-  "syd1",
-];
+// ✅ 核心：用 Node.js 运行时 + 提高函数时长，规避 Edge 的 25s 首包限制
+export const runtime = "nodejs";
+export const maxDuration = 60; // 可按套餐调大
