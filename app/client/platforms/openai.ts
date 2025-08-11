@@ -122,11 +122,16 @@ export class ChatGPTApi implements LLMApi {
   }
 
   async extractMessage(res: any) {
-    if (res.error) {
+    // 允许 res 为 string（上游返回纯文本时）
+    if (typeof res === "string") {
+      return res;
+    }
+
+    if (res?.error) {
       return "```\n" + JSON.stringify(res, null, 4) + "\n```";
     }
     // dalle3 model return url, using url create image message
-    if (res.data) {
+    if (res?.data) {
       let url = res.data?.at(0)?.url ?? "";
       const b64_json = res.data?.at(0)?.b64_json ?? "";
       if (!url && b64_json) {
@@ -142,7 +147,7 @@ export class ChatGPTApi implements LLMApi {
         },
       ];
     }
-    return res.choices?.at(0)?.message?.content ?? res;
+    return res?.choices?.at(0)?.message?.content ?? res;
   }
 
   async speech(options: SpeechOptions): Promise<ArrayBuffer> {
@@ -200,7 +205,8 @@ export class ChatGPTApi implements LLMApi {
       options.config.model.startsWith("o1") ||
       options.config.model.startsWith("o3") ||
       options.config.model.startsWith("o4-mini");
-    const isGpt5 =  options.config.model.startsWith("gpt-5");
+    const isGpt5 = options.config.model.startsWith("gpt-5");
+
     if (isDalle3) {
       const prompt = getMessageTextContent(
         options.messages.slice(-1)?.pop() as any,
@@ -226,42 +232,40 @@ export class ChatGPTApi implements LLMApi {
           messages.push({ role: v.role, content });
       }
 
-      // O1 not support image, tools (plugin in ChatGPTNextWeb) and system, stream, logprobs, temperature, top_p, n, presence_penalty, frequency_penalty yet.
+      // O1/O3 not support image, tools and system, stream, temperature/top_p/penalties yet.
       requestPayload = {
         messages,
         stream: options.config.stream,
         model: modelConfig.model,
-        temperature: (!isO1OrO3 && !isGpt5) ? modelConfig.temperature : 1,
-        presence_penalty: !isO1OrO3 ? modelConfig.presence_penalty : 0,
-        frequency_penalty: !isO1OrO3 ? modelConfig.frequency_penalty : 0,
-        top_p: !isO1OrO3 ? modelConfig.top_p : 1,
-        // max_tokens: Math.max(modelConfig.max_tokens, 1024),
-        // Please do not ask me why not send max_tokens, no reason, this param is just shit, I dont want to explain anymore.
-      };
+        // 对 o1/o3/gpt-5 强制固定参数，避免服务端拒绝或空体
+        temperature: !isO1OrO3 && !isGpt5 ? modelConfig.temperature : 1,
+        presence_penalty: !isO1OrO3 && !isGpt5 ? modelConfig.presence_penalty : 0,
+        frequency_penalty: !isO1OrO3 && !isGpt5 ? modelConfig.frequency_penalty : 0,
+        top_p: !isO1OrO3 && !isGpt5 ? modelConfig.top_p : 1,
+        // max_tokens 延后按模型处理
+      } as RequestPayload;
 
       if (isGpt5) {
-  	// Remove max_tokens if present
-  	delete requestPayload.max_tokens;
-  	// Add max_completion_tokens (or max_completion_tokens if that's what you meant)
-  	requestPayload["max_completion_tokens"] = modelConfig.max_tokens;
-
+        // gpt-5: 不发 max_tokens，用 max_completion_tokens
+        delete (requestPayload as RequestPayload).max_tokens;
+        (requestPayload as RequestPayload).max_completion_tokens =
+          modelConfig.max_tokens;
       } else if (isO1OrO3) {
-        // by default the o1/o3 models will not attempt to produce output that includes markdown formatting
-        // manually add "Formatting re-enabled" developer message to encourage markdown inclusion in model responses
-        // (https://learn.microsoft.com/en-us/azure/ai-services/openai/how-to/reasoning?tabs=python-secure#markdown-output)
-        requestPayload["messages"].unshift({
+        // 允许 markdown
+        (requestPayload as RequestPayload).messages.unshift({
           role: "developer",
           content: "Formatting re-enabled",
         });
-
-        // o1/o3 uses max_completion_tokens to control the number of tokens (https://platform.openai.com/docs/guides/reasoning#controlling-costs)
-        requestPayload["max_completion_tokens"] = modelConfig.max_tokens;
+        (requestPayload as RequestPayload).max_completion_tokens =
+          modelConfig.max_tokens;
       }
 
-
-      // add max_tokens to vision model
-      if (visionModel && !isO1OrO3 && ! isGpt5) {
-        requestPayload["max_tokens"] = Math.max(modelConfig.max_tokens, 4000);
+      // 视觉模型：补 max_tokens，但排除 o1/o3/gpt-5
+      if (visionModel && !isO1OrO3 && !isGpt5) {
+        (requestPayload as RequestPayload).max_tokens = Math.max(
+          modelConfig.max_tokens,
+          4000,
+        );
       }
     }
 
@@ -303,6 +307,7 @@ export class ChatGPTApi implements LLMApi {
           isDalle3 ? OpenaiPath.ImagePath : OpenaiPath.ChatPath,
         );
       }
+
       if (shouldStream) {
         let index = -1;
         const [tools, funcs] = usePluginStore
@@ -310,7 +315,7 @@ export class ChatGPTApi implements LLMApi {
           .getAsTools(
             useChatStore.getState().currentSession().mask?.plugin || [],
           );
-        // console.log("getAsTools", tools, funcs);
+
         streamWithThink(
           chatPath,
           requestPayload,
@@ -318,10 +323,16 @@ export class ChatGPTApi implements LLMApi {
           tools as any,
           funcs,
           controller,
-          // parseSSE
+          // parseSSE —— 加入 try/catch 容错，忽略非 JSON 片段
           (text: string, runTools: ChatMessageTool[]) => {
-            // console.log("parseSSE", text, runTools);
-            const json = JSON.parse(text);
+            let json: any = undefined;
+            try {
+              json = JSON.parse(text);
+            } catch {
+              // 可能是 keepalive/注释/空行，直接忽略
+              return { isThinking: false, content: "" };
+            }
+
             const choices = json.choices as Array<{
               delta: {
                 content: string;
@@ -340,9 +351,9 @@ export class ChatGPTApi implements LLMApi {
                 index += 1;
                 runTools.push({
                   id,
-                  type: tool_calls[0]?.type,
+                  type: (tool_calls[0] as any)?.type,
                   function: {
-                    name: tool_calls[0]?.function?.name as string,
+                    name: (tool_calls[0] as any)?.function?.name as string,
                     arguments: args,
                   },
                 });
@@ -355,33 +366,20 @@ export class ChatGPTApi implements LLMApi {
             const reasoning = choices[0]?.delta?.reasoning_content;
             const content = choices[0]?.delta?.content;
 
-            // Skip if both content and reasoning_content are empty or null
             if (
               (!reasoning || reasoning.length === 0) &&
               (!content || content.length === 0)
             ) {
-              return {
-                isThinking: false,
-                content: "",
-              };
+              return { isThinking: false, content: "" };
             }
 
             if (reasoning && reasoning.length > 0) {
-              return {
-                isThinking: true,
-                content: reasoning,
-              };
+              return { isThinking: true, content: reasoning };
             } else if (content && content.length > 0) {
-              return {
-                isThinking: false,
-                content: content,
-              };
+              return { isThinking: false, content: content };
             }
 
-            return {
-              isThinking: false,
-              content: "",
-            };
+            return { isThinking: false, content: "" };
           },
           // processToolMessage, include tool_calls message and tool call results
           (
@@ -410,17 +408,45 @@ export class ChatGPTApi implements LLMApi {
           headers: getHeaders(),
         };
 
-        // make a fetch request
+        // make a fetch request（设置超时下限 60s）
         const requestTimeoutId = setTimeout(
           () => controller.abort(),
-          getTimeoutMSByModel(options.config.model),
+          Math.max(60000, getTimeoutMSByModel(options.config.model)),
         );
 
         const res = await fetch(chatPath, chatPayload);
         clearTimeout(requestTimeoutId);
 
-        const resJson = await res.json();
-        const message = await this.extractMessage(resJson);
+        // 关键：不要直接 res.json()，先拿文本，避免空体抛错
+        const text = await res.text();
+
+        if (!res.ok) {
+          // 上游错误体透传（尽量解析 JSON）
+          let err: any = undefined;
+          try {
+            err = JSON.parse(text);
+          } catch {}
+          options.onError?.(
+            new Error(
+              err?.error?.message || text || `upstream http ${res.status}`,
+            ),
+          );
+          return;
+        }
+
+        if (!text || !text.trim()) {
+          options.onError?.(new Error("upstream empty body"));
+          return;
+        }
+
+        let resJson: any = undefined;
+        try {
+          resJson = JSON.parse(text);
+        } catch {
+          // 纯文本也直接当作消息返回
+        }
+
+        const message = await this.extractMessage(resJson ?? text);
         options.onFinish(message, res);
       }
     } catch (e) {
@@ -428,6 +454,7 @@ export class ChatGPTApi implements LLMApi {
       options.onError?.(e as Error);
     }
   }
+
   async usage() {
     const formatDate = (d: Date) =>
       `${d.getFullYear()}-${(d.getMonth() + 1).toString().padStart(2, "0")}-${d
@@ -516,8 +543,8 @@ export class ChatGPTApi implements LLMApi {
       return [];
     }
 
-    //由于目前 OpenAI 的 disableListModels 默认为 true，所以当前实际不会运行到这场
-    let seq = 1000; //同 Constant.ts 中的排序保持一致
+    // 由于目前 OpenAI 的 disableListModels 默认为 true，所以当前实际不会运行到这场
+    let seq = 1000; // 同 Constant.ts 中的排序保持一致
     return chatModels.map((m) => ({
       name: m.id,
       available: true,
